@@ -94,6 +94,7 @@
 #ifdef HAVE_LINUX_CDROM_H
 #include <linux/cdrom.h>
 #endif
+#include <linux/blkzoned.h>
 #ifdef HAVE_SYS_STAT_H
 #include <sys/stat.h>
 #endif
@@ -861,6 +862,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	struct stat sb;
 	uint64_t devsiz = 0;
 	char *dm_uuid = NULL;
+	uint32_t zone_size_sector;
 
 	blkid_reset_probe(pr);
 	blkid_probe_reset_buffers(pr);
@@ -887,6 +889,7 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 	pr->wipe_off = 0;
 	pr->wipe_size = 0;
 	pr->wipe_chain = NULL;
+	pr->zone_size = 0;
 
 	if (fd < 0)
 		return 1;
@@ -959,6 +962,9 @@ int blkid_probe_set_device(blkid_probe pr, int fd,
 #endif
 	free(dm_uuid);
 
+	if (S_ISBLK(sb.st_mode) && !ioctl(pr->fd, BLKGETZONESZ, &zone_size_sector))
+		pr->zone_size = zone_size_sector << 9;
+
 	DBG(LOWPROBE, ul_debug("ready for low-probing, offset=%"PRIu64", size=%"PRIu64"",
 				pr->off, pr->size));
 	DBG(LOWPROBE, ul_debug("whole-disk: %s, regfile: %s",
@@ -1017,8 +1023,19 @@ int blkid_probe_get_idmag(blkid_probe pr, const struct blkid_idinfo *id,
 	/* try to detect by magic string */
 	while(mag && mag->magic) {
 		unsigned char *buf;
+		uint64_t kboff;
 
-		off = (mag->kboff + (mag->sboff >> 10)) << 10;
+		if (mag->is_zone && !pr->zone_size)
+			goto next;
+
+		if (!mag->is_zone)
+			kboff = mag->kboff;
+		else if (pr->zone_size)
+			kboff = ((mag->zonenum * pr->zone_size) >> 10) + mag->kboff_inzone;
+		else
+			goto next;
+
+		off = (kboff + (mag->sboff >> 10)) << 10;
 		buf = blkid_probe_get_buffer(pr, off, 1024);
 
 		if (!buf && errno)
@@ -1028,13 +1045,15 @@ int blkid_probe_get_idmag(blkid_probe pr, const struct blkid_idinfo *id,
 				buf + (mag->sboff & 0x3ff), mag->len)) {
 
 			DBG(LOWPROBE, ul_debug("\tmagic sboff=%u, kboff=%ld",
-				mag->sboff, mag->kboff));
+				mag->sboff, kboff));
 			if (offset)
 				*offset = off + (mag->sboff & 0x3ff);
 			if (res)
 				*res = mag;
 			return BLKID_PROBE_OK;
 		}
+
+next:
 		mag++;
 	}
 

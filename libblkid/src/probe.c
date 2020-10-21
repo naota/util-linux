@@ -105,6 +105,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <stdbool.h>
 
 #include "blkidP.h"
 #include "all-io.h"
@@ -1210,9 +1211,11 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 	const char *off = NULL;
 	size_t len = 0;
 	uint64_t offset, magoff;
+	bool conventional;
 	char buf[BUFSIZ];
 	int fd, rc = 0;
 	struct blkid_chain *chn;
+	struct blk_zone_report *rep = NULL;
 
 	chn = pr->cur_chain;
 	if (!chn)
@@ -1245,27 +1248,58 @@ int blkid_do_wipe(blkid_probe pr, int dryrun)
 	if (len > sizeof(buf))
 		len = sizeof(buf);
 
+	if (!pr->zone_size) {
+		conventional = true;
+	} else {
+		size_t rep_size = sizeof(struct blk_zone_report) + sizeof(struct blk_zone);
+
+		rep = malloc(rep_size);
+		if (!rep)
+			return -1;
+
+		memset(rep, 0, rep_size);
+		rep->sector = (offset & pr->zone_size) >> 9;
+		rep->nr_zones = 1;
+		rc = ioctl(fd, BLKREPORTZONE, rep);
+		if (rc) {
+			free(rep);
+			return -1;
+		}
+
+		conventional = rep->zones[0].type == BLK_ZONE_TYPE_CONVENTIONAL;
+		free(rep);
+		rep = NULL;
+	}
+
 	DBG(LOWPROBE, ul_debug(
 	    "do_wipe [offset=0x%"PRIx64" (%"PRIu64"), len=%zu, chain=%s, idx=%d, dryrun=%s]\n",
 	    offset, offset, len, chn->driver->name, chn->idx, dryrun ? "yes" : "not"));
 
-	if (lseek(fd, offset, SEEK_SET) == (off_t) -1)
-		return -1;
-
-	memset(buf, 0, len);
-
 	if (!dryrun && len) {
-		/* wipen on device */
-		if (write_all(fd, buf, len))
-			return -1;
-		fsync(fd);
-		pr->flags &= ~BLKID_FL_MODIF_BUFF;	/* be paranoid */
+		if (conventional) {
+			if (lseek(fd, offset, SEEK_SET) == (off_t)-1)
+				return -1;
 
-		return blkid_probe_step_back(pr);
+			memset(buf, 0, len);
 
-	}
+			/* wipen on device */
+			if (write_all(fd, buf, len))
+				return -1;
+			fsync(fd);
+			pr->flags &= ~BLKID_FL_MODIF_BUFF; /* be paranoid */
 
-	if (dryrun) {
+			return blkid_probe_step_back(pr);
+		} else {
+			struct blk_zone_range range = {
+			    (offset & pr->zone_size) >> 9,
+			    pr->zone_size >> 9,
+			};
+
+			rc = ioctl(fd, BLKRESETZONE, &range);
+			if (rc < 0)
+				return -1;
+		};
+	} else {
 		/* wipe in memory only */
 		blkid_probe_hide_range(pr, magoff, len);
 		return blkid_probe_step_back(pr);
